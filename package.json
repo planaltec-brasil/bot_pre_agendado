@@ -1,0 +1,15 @@
+{
+  "name": "bot-pre-agendado",
+  "version": "1.0.0",
+  "description": "Bot de disparo de mensagens pré-agendado 24h/48h - Electrolux",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "executar": "node -e \"require('./automacao').executar('manual')\""
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "mysql2": "^3.22.0",
+    "node-cron": "^4.2.1"
+  }
+}
