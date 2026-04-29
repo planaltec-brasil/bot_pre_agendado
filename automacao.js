@@ -88,6 +88,7 @@ async function executar(motivo = 'agendado') {
         });
 
         // 1. Buscar regras apos_vinculo ativas para status 212 / empresa 101
+        console.log('\n━━━ [1/4] BUSCANDO REGRAS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         const [regras] = await conn.query(`
             SELECT RG.id, RG.nome, RG.texto_cliente, RG.execucao_horas
             FROM regras RG
@@ -100,12 +101,15 @@ async function executar(motivo = 'agendado') {
         `, [STATUS_PRE_AGENDADO, EMPRESA_ID]);
 
         if (regras.length === 0) {
-            console.log('  Nenhuma regra apos_vinculo encontrada. Encerrando.');
+            console.log('  ⚠  Nenhuma regra apos_vinculo encontrada. Encerrando.');
             return;
         }
-        console.log(`  Regras: ${regras.map(r => `${r.nome} (${r.execucao_horas}h)`).join(' | ')}`);
+        console.log(`  ✔  ${regras.length} regra(s) encontrada(s):`);
+        regras.forEach((r, i) => console.log(`       [${i + 1}] id=${r.id} | "${r.nome}" | dispara após ${r.execucao_horas}h`));
 
         // 2. Buscar OSs elegíveis: status 212, empresa 101, ativas, com log inicial criado
+        console.log('\n━━━ [2/4] BUSCANDO ATENDIMENTOS (OSs) ━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('  → Query rodando: importados_zurich status=212, empresa=101, ativas, com log inicial...');
         const [oss] = await conn.query(`
             SELECT
                 IZ.id        AS idOs,
@@ -172,12 +176,17 @@ async function executar(motivo = 'agendado') {
         ]);
 
         logEntrada.os_encontradas = oss.length;
-        console.log(`  OSs com status 212 encontradas: ${oss.length}`);
+        console.log(`  ✔  Query concluída: ${oss.length} OS(s) encontrada(s) com status 212`);
 
-        if (oss.length === 0) return;
+        if (oss.length === 0) {
+            console.log('  ⚠  Nenhuma OS elegível. Encerrando.');
+            return;
+        }
 
         // 3. Buscar em lote quais regras já foram disparadas para essas OSs
+        console.log('\n━━━ [3/4] VERIFICANDO HISTÓRICO DE DISPAROS ━━━━━━━━━━━━━━━━━━━━');
         const idsOs = oss.map(o => o.idOs);
+        console.log(`  → Checando logs_bot_parceiros para ${idsOs.length} OS(s)...`);
         const [jaExecutadas] = await conn.query(`
             SELECT idOs, prioridade
             FROM logs_bot_parceiros
@@ -188,22 +197,42 @@ async function executar(motivo = 'agendado') {
 
         // Lookup O(1): chave "idOs-regra_id"
         const executadas = new Set(jaExecutadas.map(r => `${r.idOs}-${r.prioridade}`));
+        console.log(`  ✔  ${jaExecutadas.length} disparo(s) já registrado(s) (não serão repetidos)`);
 
         // 4. Para cada OS, verificar e criar ações pendentes
+        console.log('\n━━━ [4/4] PROCESSANDO OS(s) UMA A UMA ━━━━━━━━━━━━━━━━━━━━━━━━━');
+        let osIdx = 0;
         for (const os of oss) {
+            osIdx++;
+            const prefixo = `  [${osIdx}/${oss.length}] idOs=${os.idOs} | Sinistro=${os.Sinistro} | OS=${os.OS}`;
+
             if (!os.dt_mudanca_212) {
-                console.log(`  [idOs=${os.idOs}] Sem data de mudança para 212. Pulando.`);
+                console.log(`${prefixo}`);
+                console.log(`         ⚠  Sem data de mudança para status 212. Pulando.`);
                 continue;
             }
 
-            const dtMudanca   = parseDatetimeBD(os.dt_mudanca_212);
+            const dtMudanca     = parseDatetimeBD(os.dt_mudanca_212);
             const horasPassadas = (inicio - dtMudanca) / (1000 * 60 * 60);
+            console.log(`${prefixo}`);
+            console.log(`         → Entrou em 212 em: ${os.dt_mudanca_212} (${Math.floor(horasPassadas)}h atrás)`);
+
+            let acoesCriadasNessaOs = 0;
 
             for (const regra of regras) {
-                if (horasPassadas < regra.execucao_horas) continue;
+                if (horasPassadas < regra.execucao_horas) {
+                    const faltam = (regra.execucao_horas - horasPassadas).toFixed(1);
+                    console.log(`         ⏳ Regra "${regra.nome}" (${regra.execucao_horas}h): ainda faltam ${faltam}h. Aguardando.`);
+                    continue;
+                }
 
                 const chave = `${os.idOs}-${regra.id}`;
-                if (executadas.has(chave)) continue;
+                if (executadas.has(chave)) {
+                    console.log(`         ✔  Regra "${regra.nome}" (${regra.execucao_horas}h): já disparada anteriormente. Ignorando.`);
+                    continue;
+                }
+
+                console.log(`         🚀 Regra "${regra.nome}" (${regra.execucao_horas}h): ELEGÍVEL — criando ação...`);
 
                 // Construir novo payload concatenando ao existente
                 let novoPayload;
@@ -226,49 +255,60 @@ async function executar(motivo = 'agendado') {
                         serviceOrderId: base.serviceOrderId || os.serviceOrderId
                     };
                 } catch (e) {
-                    console.error(`  [idOs=${os.idOs}] Erro ao construir payload: ${e.message}`);
+                    console.error(`         ✖  Erro ao construir payload: ${e.message}`);
                     continue;
                 }
 
                 // Inserir registro pendente — o bot externo irá processá-lo
-                await conn.query(`
-                    INSERT INTO logs_bot_parceiros
-                        (idOs, serviceOrderId, empresa_id, acao, endpoint,
-                         payload, status_code, origem, usuario_responsavel, prioridade)
-                    VALUES (?, ?, ?, 'Editar mensagem', 'editar-os-electrolux',
-                            ?, ?, 'editar-os-electrolux', ?, ?)
-                `, [
-                    os.idOs,
-                    novoPayload.serviceOrderId,
-                    EMPRESA_ID,
-                    JSON.stringify(novoPayload),
-                    STATUS_PRE_AGENDADO,
-                    os.usuario_responsavel || '39',
-                    regra.id
-                ]);
+                try {
+                    await conn.query(`
+                        INSERT INTO logs_bot_parceiros
+                            (idOs, serviceOrderId, empresa_id, acao, endpoint,
+                             payload, status_code, origem, usuario_responsavel, prioridade)
+                        VALUES (?, ?, ?, 'Editar mensagem', 'editar-os-electrolux',
+                                ?, ?, 'editar-os-electrolux', ?, ?)
+                    `, [
+                        os.idOs,
+                        novoPayload.serviceOrderId,
+                        EMPRESA_ID,
+                        JSON.stringify(novoPayload),
+                        STATUS_PRE_AGENDADO,
+                        os.usuario_responsavel || '39',
+                        regra.id
+                    ]);
 
-                // Evitar duplicação na mesma rodada
-                executadas.add(chave);
+                    // Evitar duplicação na mesma rodada
+                    executadas.add(chave);
+                    acoesCriadasNessaOs++;
+                    logEntrada.acoes_criadas++;
 
-                logEntrada.acoes_criadas++;
+                    console.log(`         ✔  Ação inserida com sucesso! (serviceOrderId=${novoPayload.serviceOrderId})`);
+                } catch (e) {
+                    console.error(`         ✖  Falha ao inserir no banco: ${e.message}`);
+                    continue;
+                }
+
                 logEntrada.detalhes.push({
-                    idOs:          os.idOs,
-                    sinistro:      os.Sinistro,
-                    os:            os.OS,
-                    regra_id:      regra.id,
-                    regra:         regra.nome,
-                    horas_regra:   regra.execucao_horas,
+                    idOs:           os.idOs,
+                    sinistro:       os.Sinistro,
+                    os:             os.OS,
+                    regra_id:       regra.id,
+                    regra:          regra.nome,
+                    horas_regra:    regra.execucao_horas,
                     horas_passadas: Math.floor(horasPassadas)
                 });
+            }
 
-                console.log(
-                    `  [idOs=${os.idOs}] ${os.Sinistro} → "${regra.nome}"` +
-                    ` (regra ${regra.execucao_horas}h | passadas ${Math.floor(horasPassadas)}h)`
-                );
+            if (acoesCriadasNessaOs === 0) {
+                console.log(`         — Nenhuma nova ação criada para esta OS.`);
+            } else {
+                console.log(`         ★  ${acoesCriadasNessaOs} ação(ões) criada(s) para esta OS.`);
             }
         }
 
-        console.log(`  Total de ações criadas: ${logEntrada.acoes_criadas}`);
+        console.log(`\n━━━ RESUMO ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`  OSs processadas : ${oss.length}`);
+        console.log(`  Ações criadas   : ${logEntrada.acoes_criadas}`);
 
     } catch (err) {
         logEntrada.erro = err.message;
